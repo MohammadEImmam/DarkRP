@@ -57,11 +57,18 @@ Chat
 				flex-shrink: 0;
 			}
 
+			.tag
+			{
+				white-space: nowrap;
+				flex-shrink: 0;
+			}
+
 			.message
 			{
 				font-weight: 500;
 				font-size: 18px;
 				color: #fff;
+				flex-grow: 1;
 			}
 		}
 	}

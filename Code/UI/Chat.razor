@@ -1,21 +1,26 @@
 ﻿@using Sandbox;
-@using Sandbox.UI;
 @using Sandbox.Utility
 @namespace Sandbox
+@using System.Globalization
+@using System.Text
 @inherits PanelComponent
 
 <root>
 
     <div class="output">
-        @foreach (var entry in Entries)
+        @foreach (var entry in _entries)
         {
             <div class="chat_entry">
-                @if (entry.steamid > 0)
+                @if (entry.SteamId > 0)
                 {
-                    <div class="avatar" style="background-image: url( avatar:@entry.steamid )"></div>
+                    <div class="avatar" style="@GetAvatarStyle(entry.SteamId)"></div>
                 }
-                <div class="author">@entry.author</div>
-                <div class="message">@entry.message</div>
+                <div class="author">@entry.Author</div>
+                @if (!string.IsNullOrWhiteSpace(entry.Tag))
+                {
+                    <div class="tag" style="@entry.TagStyle">@entry.Tag</div>
+                }
+                <div class="message" style="@entry.MessageStyle">@entry.Message</div>
             </div>
         }
     </div>
@@ -38,6 +43,7 @@
                 }
             </div>
         }
+        <TextEntry @ref="_inputBox" @onsubmit="@ChatFinished"></TextEntry>
     </div>
 
 </root>
@@ -51,29 +57,37 @@
     public record Entry( ulong steamid, string author, string message, RealTimeSince timeSinceAdded );
     List<Entry> Entries = new();
     List<ChatCommandPreview> Suggestions = new();
+    TextEntry _inputBox;
+    static readonly HashSet<string> BypassedCommandNames = new(StringComparer.OrdinalIgnoreCase) { "name", "drop", "ban", "kick" };
+
+    public record Entry( ulong SteamId, string Author, string Message, string Tag, string TagStyle, string MessageStyle, RealTimeSince TimeSinceAdded );
+    List<Entry> _entries = new();
 
     protected override void OnUpdate()
     {
-        if (InputBox is null)
+        if (_inputBox is null)
             return;
 
         Panel.AcceptsFocus = false;
 
         if ( Input.Pressed( "chat" ) )
         {
-            InputBox.Focus();
+            _inputBox.Focus();
         }
 
         UpdateCommandSuggestions();
 
         if ( Entries.RemoveAll( x => x.timeSinceAdded > 20.0f ) > 0 )
+        if ( _entries.RemoveAll( x => x.TimeSinceAdded > 20.0f ) > 0 )
         {
             StateHasChanged();
         }
 
-        SetClass( "open", InputBox.HasFocus );
+        SetClass( "open", _inputBox.HasFocus );
         SetClass( "hide", Player.FindLocalPlayer()?.WantsHideHud ?? false );
     }
+
+    static string GetAvatarStyle( ulong steamId ) => $"background-image: url('avatar:{steamId}');";
 
     void ChatFinished()
     {
@@ -82,6 +96,8 @@
         Suggestions.Clear();
         LastInputText = "";
         LastInputFocused = false;
+        var text = _inputBox.Text;
+        _inputBox.Text = "";
 
         if (string.IsNullOrWhiteSpace(text))
             return;
@@ -91,6 +107,9 @@
             RequestRunCommand(text);
             StateHasChanged();
             return;
+        if ( text.Contains( "colmore", StringComparison.OrdinalIgnoreCase ) )
+        {
+            Services.Stats.Increment( "secret_phrase", 1 );
         }
 
         AddText( text );
@@ -128,6 +147,9 @@
        var chat = Game.ActiveScene.GetAll<Chat>()
                                 .FirstOrDefault();
 
+       if ( chat is null )
+           return;
+
        if ( Application.IsDedicatedServer )
        {
            chat.AddSystemText( msg );
@@ -139,29 +161,206 @@
     }
 
 	[Rpc.Broadcast]
-    public void AddText( string message )
+    private void AddText( string message )
     {
+        if ( !Networking.IsHost )
+            return;
+
         message = message.Truncate( 300 );
+        message = message?.Trim();
 
         if (string.IsNullOrWhiteSpace(message))
             return;
 
-        var author = Rpc.Caller.DisplayName;
-        var steamid = Rpc.Caller.SteamId;
+        var source = Rpc.Caller;
+        if ( source is null )
+            return;
+
+        if ( TryHandleBypassedCommand( source, message ) )
+            return;
+
+        if ( TryParsePrefixedCommand( message, out var token, out var payload ) )
+        {
+            var definition = ChatCommandDefinition.FindForToken( token );
+            if ( definition is not null )
+            {
+                if ( string.IsNullOrWhiteSpace( payload ) )
+                    return;
+
+                BroadcastPlayerText(
+                    source,
+                    payload,
+                    definition.Tag,
+                    BuildStyleString( definition.TagColor, definition.TagFont, definition.TagBold, definition.TagItalic ),
+                    BuildStyleString( definition.MessageColor, definition.MessageFont, definition.MessageBold, definition.MessageItalic )
+                );
+                return;
+            }
+        }
+
+        BroadcastPlayerText( source, message, null, null, null );
+    }
+
+    private bool TryHandleBypassedCommand( Connection source, string message )
+    {
+        if ( !TryParsePrefixedCommand( message, out var token, out var payload ) )
+            return false;
+
+        var commandName = token[1..];
+        if ( !BypassedCommandNames.Contains( commandName ) )
+            return false;
+
+        var player = Player.FindForConnection( source );
+
+        switch ( commandName )
+        {
+            case "name":
+                if ( !string.IsNullOrWhiteSpace( payload ) )
+                    player?.RequestSetRoleplayName( payload );
+                return true;
+
+            case "drop":
+                if ( int.TryParse( payload, out var amount ) )
+                    player?.RequestDropMoney( amount );
+                return true;
+
+            case "kick":
+                return TryRunKickBypass( player, payload );
+
+            case "ban":
+                return TryRunBanBypass( player, payload );
+        }
+
+        return true;
+    }
+
+    static bool TryRunKickBypass( Player player, string payload )
+    {
+        if ( !TrySplitTargetAndReason( payload, out var target, out var reason ) )
+            return true;
+
+        var connection = ResolveConnection( target );
+        if ( connection is null )
+            return true;
+
+        player?.RequestKickPlayer( connection.SteamId.Value, reason );
+        return true;
+    }
+
+    static bool TryRunBanBypass( Player player, string payload )
+    {
+        if ( !TrySplitTargetAndReason( payload, out var target, out var reason ) )
+            return true;
+
+        var connection = ResolveConnection( target );
+        if ( connection is null )
+            return true;
+
+        player?.RequestBanPlayer( connection.SteamId.Value, reason );
+        return true;
+    }
+
+    static Connection ResolveConnection( string target )
+    {
+        if ( string.IsNullOrWhiteSpace( target ) )
+            return null;
+
+        if ( ulong.TryParse( target.Trim(), out var steamId ) )
+            return Connection.All.FirstOrDefault( x => x.SteamId == steamId );
+
+        return GameManager.FindPlayerWithName( target.Trim() );
+    }
+
+    static bool TrySplitTargetAndReason( string payload, out string target, out string reason )
+    {
+        target = null;
+        reason = null;
+
+        if ( string.IsNullOrWhiteSpace( payload ) )
+            return false;
+
+        var trimmed = payload.Trim();
+        var splitIndex = trimmed.IndexOf( ' ' );
+        if ( splitIndex < 0 )
+        {
+            target = trimmed;
+            return true;
+        }
+
+        target = trimmed[..splitIndex];
+        reason = trimmed[(splitIndex + 1)..].Trim();
+        return true;
+    }
+
+    static bool TryParsePrefixedCommand( string message, out string token, out string payload )
+    {
+        token = null;
+        payload = null;
+
+        if ( string.IsNullOrWhiteSpace( message ) )
+            return false;
+
+        var trimmed = message.Trim();
+        if ( trimmed.Length < 2 )
+            return false;
+
+        var prefix = trimmed[0];
+        if ( prefix is not ('/' or '!') )
+            return false;
+
+        var splitIndex = trimmed.IndexOf( ' ' );
+        token = splitIndex < 0 ? trimmed : trimmed[..splitIndex];
+        token = token.ToLowerInvariant();
+        payload = splitIndex < 0 ? string.Empty : trimmed[(splitIndex + 1)..].Trim();
+        return true;
+    }
+
+    private void BroadcastPlayerText( Connection source, string message, string tag, string tagStyle, string messageStyle )
+    {
+        if ( source is null )
+            return;
+
+        var author = source.DisplayName;
+        var steamid = source.SteamId;
 
 		Log.Info($"{author}: {message}");
-
-		if ( Rpc.Caller == Connection.Local && message.Contains( "colmore", StringComparison.OrdinalIgnoreCase ) )
-		{
-			Sandbox.Services.Stats.Increment( "secret_phrase", 1 );
-        }
 
         var filteredName = Steam.FilterName(author, steamid);
         message = Steam.FilterChat(message, steamid);
 
-        Entries.Add(new Entry(steamid, filteredName, message, 0.0f));
+        ReceivePlayerText( steamid, filteredName, message, tag, tagStyle, messageStyle );
+    }
+
+	[Rpc.Broadcast( NetFlags.HostOnly )]
+    private void ReceivePlayerText( ulong steamid, string author, string message, string tag, string tagStyle, string messageStyle )
+    {
+        if ( string.IsNullOrWhiteSpace( message ) )
+            return;
+
+        _entries.Add(new Entry(steamid, author, message, tag, tagStyle, messageStyle, 0.0f));
 		StateHasChanged();
 	}
+
+    static string BuildStyleString( Color color, string font, bool bold, bool italic )
+    {
+        var builder = new StringBuilder();
+        var r = Math.Clamp( (int)(color.r * 255f), 0, 255 );
+        var g = Math.Clamp( (int)(color.g * 255f), 0, 255 );
+        var b = Math.Clamp( (int)(color.b * 255f), 0, 255 );
+        var a = Math.Clamp( color.a, 0f, 1f );
+
+        builder.Append( $"color: rgba({r}, {g}, {b}, {a.ToString( "0.###", CultureInfo.InvariantCulture )});" );
+
+        if ( !string.IsNullOrWhiteSpace( font ) )
+        {
+            var sanitizedFont = font.Replace( "\"", "" );
+            builder.Append( $"font-family: '{sanitizedFont}';" );
+        }
+
+        builder.Append( bold ? "font-weight: 700;" : "font-weight: 500;" );
+        builder.Append( italic ? "font-style: italic;" : "font-style: normal;" );
+        return builder.ToString();
+    }
 
 	[Rpc.Broadcast( NetFlags.HostOnly )]
     public void AddSystemText( string message, string icon = "ℹ️" )
@@ -171,7 +370,7 @@
         if (string.IsNullOrWhiteSpace(message))
             return;
 
-        Entries.Add(new Entry(0, icon, message, 0.0f));
+        _entries.Add(new Entry(0, icon, message, null, null, null, 0.0f));
         StateHasChanged();
     }
 
